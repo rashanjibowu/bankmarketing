@@ -1,0 +1,8 @@
+# data files - should be downloaded by users
+data/
+
+# history
+.Rhistory
+
+# cache files
+*_cache/

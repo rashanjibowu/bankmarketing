@@ -1,0 +1,306 @@
+---
+title: "Bank Marketing Model"
+author: "Rashan Jibowu"
+date: "May 18, 2015"
+output:
+  html_document:
+    keep_md: yes
+    pandoc_args: [
+      "+RTS", "-K64m",
+      "-RTS"
+    ]
+---
+
+This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account.
+
+Require necessary packages
+
+```{r load_packages}
+
+library(plyr)
+library(caret)
+library(ggplot2)
+library(lattice)
+
+```
+
+Load and summarize the data
+
+```{r load_summarize}
+
+data <- read.csv("./data/bank/bank.csv", sep = ";")
+str(data)
+summary(data)
+
+```
+
+Clean the data
+
+```{r clean}
+
+data <- rename(data, c("default" = "in_default",
+                       "housing" = "housing_loan",
+                       "loan" = "personal_loan",
+                       "contact" = "last_contact_type",
+                       "month" = "last_contact_month",
+                       "day" = "last_contact_dayofweek",
+                       "duration" = "last_contact_duration",
+                       "campaign" = "contact_count",
+                       "pdays" = "days_since_last_contact",
+                       "previous" = "prev_campaigns_contact_count",
+                       "poutcome" = "previous_outcome")
+       )
+
+# remove data that should have no bearing (time of last contact and duration)
+data <- data[, -(10:12)]
+
+names(data)
+
+```
+
+#### Exploratory Data Analysis
+
+Relationship with Age
+
+```{r age}
+
+g <- ggplot(aes(x = age, y = in_default, color = y), data = data)
+g + geom_point()
+
+```
+
+Relationship with Job and Age
+
+```{r jobage}
+
+g <- ggplot(aes(x = age, y = job, color = y), data = data)
+g + geom_point()
+
+```
+
+Relationship with Balance
+
+```{r balanceage}
+
+g <- ggplot(aes(x = balance, y = age, color = y), data = data)
+g + geom_point()
+
+```
+
+Let's try the following models:
+
+1. Random Forest Model
+2. Regularized Discriminant Analysis
+3. Gradient Boosted Trees
+4. Partial Least Squares
+5. Naive Bayes
+6. Neural Network
+7. Logistic Regression
+8. Boosted Logistic Regression 
+
+Partition the Data
+
+```{r partition}
+
+set.seed(123)
+
+inTrain <- createDataPartition(y = data$y, p = 0.75, list = FALSE)
+training <- data[inTrain, ]
+testing <- data[-inTrain, ]
+
+dim(training)
+dim(testing)
+
+```
+
+Set model parameters
+
+```{r tuning}
+
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 3,
+                           repeats = 10,
+                           allowParallel = TRUE,
+                           savePredictions = TRUE,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary)
+
+metric <- c("ROC")
+
+```
+
+Random Forest
+
+```{r train_rf, cache=TRUE}
+
+system.time(rf.fit <- train(y ~., 
+                            data = training, 
+                            method = "rf",
+                            trControl = fitControl,
+                            metric = metric
+                            )
+            )
+
+ggplot(rf.fit) + theme(legend.position = "top")
+
+```
+
+Regularized Discriminant Analysis
+
+```{r train_lda, cache=TRUE}
+
+#system.time(rda.fit <- train(y ~ ., 
+ #                            data = training, 
+  #                           method = "rda",
+   #                          metric = metric,
+    #                         trControl = fitControl)
+     #       )
+
+#plot(rda.fit)
+
+```
+
+Gradient Boosted Trees
+
+```{r train_gbm, cache=TRUE}
+
+grid <- expand.grid(interaction.depth = seq(1, 7, by = 2),
+                    n.trees = seq(100, 1000, by = 50),
+                    shrinkage = c(0.01, 0.1),
+                    n.minobsinnode = 10)
+
+system.time(gbm.fit <- train(y ~ ., 
+                             data = training, 
+                             method = "gbm", 
+                             trControl = fitControl,
+                             tuneGrid = grid,
+                             metric = metric,
+                             verbose = FALSE)
+            )
+
+plot(gbm.fit)
+
+ggplot(gbm.fit) + theme(legend.position = "top")
+
+```
+
+Partial Least Squares Model
+
+```{r train_pls}
+
+#system.time(pls.fit <- train(y ~ ., 
+ #                            data = training, 
+  #                           method = "pls",
+   #                          metric = metric
+    #                         )
+     #       )
+
+#plot(pls.fit)
+
+```
+
+Naive Bayes
+
+```{r naive_bayes}
+
+#system.time(nb.fit <- train(formula = formula,
+ #                           data = training,
+  #                          method = "nb", 
+   #                         metric = metric, 
+    #                        trControl = fitControl)
+     #       )
+
+#plot(nb.fit)
+
+```
+
+Neural Network
+
+```{r neural_network}
+
+#system.time(nn.fit <- train(formula = formula,
+     #                       data = training,
+    #                        method = "nnet",
+   #                         metric = metric,
+  #                          trControl = fitControl)
+ #           )
+
+#plot(nn.fit)
+```
+
+Logistic Regression
+
+```{r logisitic_regression}
+
+system.time(glmfit <- glm(y ~ ., data = training, family = "binomial"))
+print(glmfit)
+
+```
+
+Boosted Logistic Regression
+
+```{r boosted_logit}
+
+#system.time(blogit.fit <- train(formula = formula,
+#                                data = training,
+#                                method = "LogitBoost",
+#                                metric = metric,
+#                                trControl = fitControl)
+#            )
+
+#plot(blogit.fit)
+
+```
+
+Evaluation
+
+```{r evaluate}
+
+# Random Forest
+rf.pred <- predict(rf.fit, newdata = training)
+confusionMatrix(data = rf.pred, reference = training$y, positive = "yes")
+
+rf.pred.test <- predict(rf.fit, newdata = testing)
+confusionMatrix(data = rf.pred.test, reference = testing$y, positive = "yes")
+
+# Regularized Discriminant Analysis
+#rda.pred <- predict(rda.fit, newdata = training)
+#confusionMatrix(rda.pred, training$y)
+
+# Gradient Boosted Trees
+gbm.pred <- predict(gbm.fit, newdata = training)
+confusionMatrix(data = gbm.pred, reference = training$y, positive = "yes")
+
+gbm.pred.test <- predict(gbm.fit, newdata = training)
+confusionMatrix(data = gbm.pred.test, reference = training$y, positive = "yes")
+
+# Partial Least Squares
+#pls.pred <- predict(pls.fit, newdata = training)
+#confusionMatrix(pls.pred, training$y)
+
+# Naive Bayes
+#nb.pred <- predict(nb.fit, newdata = training)
+#confusionMatrix(nb.pred, training$y)
+
+# Neural Network
+#nn.pred <- predict(nn.fit, newdata = training)
+#confusionMatrix(nn.pred, training$y)
+
+# Boosted Logistic Regression
+#blogit.pred <- predict(blogit.fit, newdata = training)
+#confusionMatrix(blogit.pred, training$y)
+
+#print(rf.fit)
+
+```
+
+Variable Importance
+
+```{r variable_importance}
+
+# variable importance
+varImp(rf.fit)
+
+varImp(gbm.fit)
+
+```

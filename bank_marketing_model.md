@@ -4,25 +4,53 @@ May 18, 2015
 
 This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account.
 
+### Preparing the environment
+
 Require necessary packages
 
 
 ```r
-library(plyr)
-library(caret)
+require(plyr, quietly = TRUE, warn.conflicts = FALSE)
+require(caret, quietly = TRUE, warn.conflicts = FALSE)
+require(ggplot2, quietly = TRUE, warn.conflicts = FALSE)
+require(lattice, quietly = TRUE, warn.conflicts = FALSE)
+require(doParallel, quietly = TRUE, warn.conflicts = FALSE)
+suppressWarnings(require(pROC, quietly = TRUE, warn.conflicts = FALSE))
 ```
 
 ```
-## Loading required package: lattice
-## Loading required package: ggplot2
+## Type 'citation("pROC")' for a citation.
 ```
 
 ```r
-library(ggplot2)
-library(lattice)
+require(reshape2, quietly = TRUE, warn.conflicts = FALSE)
+suppressWarnings(require(randomForest, quietly = TRUE, warn.conflicts = FALSE))
 ```
 
-Load and summarize the data
+```
+## randomForest 4.6-10
+## Type rfNews() to see new features/changes/bug fixes.
+```
+
+```r
+require(rpart, quietly = TRUE, warn.conflicts = FALSE)
+```
+
+Set up parallel processing
+
+
+```r
+cores = detectCores()
+
+# use all but 1 core to process data
+if (cores > 1) {
+    cores <- cores - 1
+}
+
+registerDoParallel(cores = cores)
+```
+
+Load and check the data
 
 
 ```r
@@ -90,7 +118,9 @@ summary(data)
 ## 
 ```
 
-Clean the data
+### Clean the data
+
+Based on the details from the data source, let's rename the variables to provide better context.
 
 
 ```r
@@ -106,7 +136,12 @@ data <- rename(data, c("default" = "in_default",
                        "previous" = "prev_campaigns_contact_count",
                        "poutcome" = "previous_outcome")
        )
+```
 
+We should also remove variables that ought not to be part of the modelling. For example, we won't knw in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
+
+
+```r
 # remove data that should have no bearing (time of last contact and duration)
 data <- data[, -(10:12)]
 
@@ -124,6 +159,28 @@ names(data)
 ```
 
 #### Exploratory Data Analysis
+
+Histogram of target variable
+
+
+```r
+ggplot(data = data, aes(y)) + geom_histogram()
+```
+
+![](bank_marketing_model_files/figure-html/target_distribution-1.png) 
+
+The distribution of the target variable is quite unbalanced. We'll need to address this later when we get to the model building stage.
+
+
+```r
+table(data$y)
+```
+
+```
+## 
+##   no  yes 
+## 4000  521
+```
 
 Relationship with Age
 
@@ -145,7 +202,7 @@ g + geom_point()
 
 ![](bank_marketing_model_files/figure-html/jobage-1.png) 
 
-Relationship with Balance
+Relationship with Account Balance
 
 
 ```r
@@ -158,13 +215,9 @@ g + geom_point()
 Let's try the following models:
 
 1. Random Forest Model
-2. Regularized Discriminant Analysis
-3. Gradient Boosted Trees
-4. Partial Least Squares
-5. Naive Bayes
-6. Neural Network
-7. Logistic Regression
-8. Boosted Logistic Regression 
+2. Optimized version of Random Forest (to deal with imbalanced class distribution in target variable)
+3. Gradient Boosted Machines
+4. Logistic Regression
 
 Partition the Data
 
@@ -206,200 +259,267 @@ fitControl <- trainControl(method = "repeatedcv",
 metric <- c("ROC")
 ```
 
-Random Forest
+Random Forest Model
 
 
 ```r
-system.time(rf.fit <- train(y ~., 
-                            data = training, 
-                            method = "rf",
-                            trControl = fitControl,
-                            metric = metric
-                            )
-            )
+rf.fit <- train(y ~., 
+                data = training, 
+                method = "rf",
+                trControl = fitControl,
+                metric = metric
+                )
 ```
 
-```
-##    user  system elapsed 
-## 282.565   3.203 286.167
-```
+Optimized Random Forest Model
 
-```r
-ggplot(rf.fit) + theme(legend.position = "top")
-```
-
-![](bank_marketing_model_files/figure-html/train_rf-1.png) 
-
-Regularized Discriminant Analysis
+This optimization procedure is adapted from Max Kuhn, who details the procedure [here](http://topepo.github.io/caret/custom_models.html)
 
 
 ```r
-#system.time(rda.fit <- train(y ~ ., 
- #                            data = training, 
-  #                           method = "rda",
-   #                          metric = metric,
-    #                         trControl = fitControl)
-     #       )
+## Get the model code for the original random forest method:
+thresh_code <- getModelInfo("rf", regex = FALSE)[[1]]
+thresh_code$type <- c("Classification")
 
-#plot(rda.fit)
+## Add the threshold as another tuning parameter
+thresh_code$parameters <- data.frame(parameter = c("mtry", "threshold"),
+                                     class = c("numeric", "numeric"),
+                                     label = c("#Randomly Selected Predictors",
+                                               "Probability Cutoff"))
+## The default tuning grid code:
+thresh_code$grid <- function(x, y, len = NULL) {
+  p <- ncol(x)
+  expand.grid(mtry = floor(sqrt(p)),
+              threshold = seq(.5, .99, by = .01))
+  }
+
+## Here we fit a single random forest model (with a fixed mtry)
+## and loop over the threshold values to get predictions from the same
+## randomForest model.
+thresh_code$loop = function(grid) {
+                 library(plyr)
+                 loop <- ddply(grid, c("mtry"),
+                               function(x) c(threshold = max(x$threshold)))
+                 submodels <- vector(mode = "list", length = nrow(loop))
+                 for(i in seq(along = loop$threshold)) {
+                   index <- which(grid$mtry == loop$mtry[i])
+                   cuts <- grid[index, "threshold"]
+                   submodels[[i]] <- data.frame(threshold = cuts[cuts != loop$threshold[i]])
+                 }
+                 list(loop = loop, submodels = submodels)
+               }
+
+## Fit the model independent of the threshold parameter
+thresh_code$fit = function(x, y, wts, param, lev, last, classProbs, ...) {
+  if(length(levels(y)) != 2)
+    stop("This works only for 2-class problems")
+  randomForest(x, y, mtry = param$mtry, ...)
+  }
+
+## Now get a probability prediction and use different thresholds to
+## get the predicted class
+thresh_code$predict = function(modelFit, newdata, submodels = NULL) {
+  class1Prob <- predict(modelFit,
+                        newdata,
+                        type = "prob")[, modelFit$obsLevels[1]]
+  ## Raise the threshold for class #1 and a higher level of
+  ## evidence is needed to call it class 1 so it should 
+  ## decrease sensitivity and increase specificity
+  out <- ifelse(class1Prob >= modelFit$tuneValue$threshold,
+                modelFit$obsLevels[1],
+                modelFit$obsLevels[2])
+  if(!is.null(submodels)) {
+    tmp2 <- out
+    out <- vector(mode = "list", length = length(submodels$threshold))
+    out[[1]] <- tmp2
+    for(i in seq(along = submodels$threshold)) {
+      out[[i+1]] <- ifelse(class1Prob >= submodels$threshold[[i]],
+                           modelFit$obsLevels[1],
+                           modelFit$obsLevels[2])
+      }
+    }
+  out
+  }
+
+## The probabilities are always the same but we have to create
+## mulitple versions of the probs to evaluate the data across
+## thresholds
+thresh_code$prob = function(modelFit, newdata, submodels = NULL) {
+  out <- as.data.frame(predict(modelFit, newdata, type = "prob"))
+  if(!is.null(submodels)) {
+    probs <- out
+    out <- vector(mode = "list", length = length(submodels$threshold)+1)
+    out <- lapply(out, function(x) probs)
+    }
+  out
+  }
 ```
 
-Gradient Boosted Trees
+Optimizing the model
 
 
 ```r
-grid <- expand.grid(interaction.depth = seq(1, 7, by = 2),
-                    n.trees = seq(100, 1000, by = 50),
-                    shrinkage = c(0.01, 0.1),
+fourStats <- function (data, lev = levels(data$obs), model = NULL) {
+  ## This code will get use the area under the ROC curve and the
+  ## sensitivity and specificity values using the current candidate
+  ## value of the probability threshold.
+  out <- c(twoClassSummary(data, lev = levels(data$obs), model = NULL))
+
+  ## The best possible model has sensitivity of 1 and specificity of 1. 
+  ## How far are we from that value?
+  coords <- matrix(c(1, 1, out["Spec"], out["Sens"]),
+                   ncol = 2,
+                   byrow = TRUE)
+  colnames(coords) <- c("Spec", "Sens")
+  rownames(coords) <- c("Best", "Current")
+  c(out, Dist = dist(coords)[1])
+}
+
+rf.optimized <- train(y ~ ., data = training,
+              method = thresh_code,
+              ## Minimize the distance to the perfect model
+              metric = "Dist",
+              maximize = FALSE,
+              tuneLength = 20,
+              ntree = 1000,
+              trControl = trainControl(method = "repeatedcv",
+                                       repeats = 5,
+                                       classProbs = TRUE,
+                                       summaryFunction = fourStats))
+```
+
+Plotting the revised results
+
+
+```r
+metrics <- rf.optimized$results[, c(2, 4:6)]
+metrics <- melt(metrics, id.vars = "threshold",
+                variable.name = "Resampled",
+                value.name = "Data")
+
+ggplot(metrics, aes(x = threshold, y = Data, color = Resampled)) +
+  geom_line() +
+  ylab("") + xlab("Probability Cutoff") +
+  theme(legend.position = "top")
+```
+
+![](bank_marketing_model_files/figure-html/plot_tunable_rf-1.png) 
+
+Gradient Boosted Machines
+
+
+```r
+grid <- expand.grid(interaction.depth = seq(3, 7, by = 2),
+                    n.trees = seq(500, 1000, by = 100),
+                    shrinkage = 0.01,
                     n.minobsinnode = 10)
 
-system.time(gbm.fit <- train(y ~ ., 
-                             data = training, 
-                             method = "gbm", 
-                             trControl = fitControl,
-                             tuneGrid = grid,
-                             metric = metric,
-                             verbose = FALSE)
-            )
+gbm.fit <- train(y ~ ., 
+                 data = training, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 tuneGrid = grid,
+                 metric = metric,
+                 maximize = TRUE,
+                 verbose = FALSE)     
 ```
 
 ```
-##    user  system elapsed 
-## 764.449   5.701 770.241
+## Loading required package: gbm
+## Loading required package: survival
+## 
+## Attaching package: 'survival'
+## 
+## The following object is masked from 'package:caret':
+## 
+##     cluster
+## 
+## Loading required package: splines
+## Loaded gbm 2.1.1
 ```
 
 ```r
-plot(gbm.fit)
-```
-
-![](bank_marketing_model_files/figure-html/train_gbm-1.png) 
-
-```r
+# plot the various model performances
 ggplot(gbm.fit) + theme(legend.position = "top")
 ```
 
-![](bank_marketing_model_files/figure-html/train_gbm-2.png) 
-
-Partial Least Squares Model
-
-
-```r
-#system.time(pls.fit <- train(y ~ ., 
- #                            data = training, 
-  #                           method = "pls",
-   #                          metric = metric
-    #                         )
-     #       )
-
-#plot(pls.fit)
-```
-
-Naive Bayes
-
-
-```r
-#system.time(nb.fit <- train(formula = formula,
- #                           data = training,
-  #                          method = "nb", 
-   #                         metric = metric, 
-    #                        trControl = fitControl)
-     #       )
-
-#plot(nb.fit)
-```
-
-Neural Network
-
-
-```r
-#system.time(nn.fit <- train(formula = formula,
-     #                       data = training,
-    #                        method = "nnet",
-   #                         metric = metric,
-  #                          trControl = fitControl)
- #           )
-
-#plot(nn.fit)
-```
+![](bank_marketing_model_files/figure-html/train_gbm-1.png) 
 
 Logistic Regression
 
 
 ```r
-system.time(glmfit <- glm(y ~ ., data = training, family = "binomial"))
-```
+glmfit <- glm(y ~ ., 
+              data = training, 
+              family = "binomial")
 
-```
-##    user  system elapsed 
-##   0.040   0.003   0.043
-```
-
-```r
-print(glmfit)
+summary(glmfit)
 ```
 
 ```
 ## 
-## Call:  glm(formula = y ~ ., family = "binomial", data = training)
+## Call:
+## glm(formula = y ~ ., family = "binomial", data = training)
+## 
+## Deviance Residuals: 
+##     Min       1Q   Median       3Q      Max  
+## -1.8928  -0.5187  -0.4042  -0.2852   2.9966  
 ## 
 ## Coefficients:
-##                  (Intercept)                           age  
-##                   -1.271e+00                     6.647e-03  
-##               jobblue-collar               jobentrepreneur  
-##                   -1.267e-01                    -2.103e-02  
-##                 jobhousemaid                 jobmanagement  
-##                    9.901e-02                    -9.633e-02  
-##                   jobretired              jobself-employed  
-##                    5.459e-01                     2.902e-02  
-##                  jobservices                    jobstudent  
-##                   -1.807e-01                     2.002e-01  
-##                jobtechnician                 jobunemployed  
-##                   -3.021e-01                    -2.021e-01  
-##                   jobunknown                maritalmarried  
-##                    1.551e-01                    -4.307e-01  
-##                maritalsingle            educationsecondary  
-##                   -8.825e-02                     8.748e-02  
-##            educationtertiary              educationunknown  
-##                    3.624e-01                    -2.931e-01  
-##                in_defaultyes                       balance  
-##                    2.745e-01                    -4.791e-06  
-##              housing_loanyes              personal_loanyes  
-##                   -3.516e-01                    -5.471e-01  
-##   last_contact_typetelephone      last_contact_typeunknown  
-##                   -1.813e-01                    -8.411e-01  
-##                contact_count       days_since_last_contact  
-##                   -7.445e-02                    -1.209e-03  
-## prev_campaigns_contact_count         previous_outcomeother  
-##                    2.236e-02                     4.540e-01  
-##      previous_outcomesuccess       previous_outcomeunknown  
-##                    2.064e+00                    -4.089e-01  
+##                                Estimate Std. Error z value Pr(>|z|)    
+## (Intercept)                  -1.271e+00  5.516e-01  -2.303  0.02125 *  
+## age                           6.647e-03  7.022e-03   0.947  0.34387    
+## jobblue-collar               -1.267e-01  2.382e-01  -0.532  0.59490    
+## jobentrepreneur              -2.103e-02  3.566e-01  -0.059  0.95296    
+## jobhousemaid                  9.901e-02  3.935e-01   0.252  0.80133    
+## jobmanagement                -9.633e-02  2.381e-01  -0.404  0.68585    
+## jobretired                    5.459e-01  3.089e-01   1.767  0.07722 .  
+## jobself-employed              2.902e-02  3.374e-01   0.086  0.93147    
+## jobservices                  -1.807e-01  2.692e-01  -0.671  0.50198    
+## jobstudent                    2.002e-01  4.183e-01   0.479  0.63224    
+## jobtechnician                -3.021e-01  2.274e-01  -1.329  0.18395    
+## jobunemployed                -2.021e-01  3.727e-01  -0.542  0.58772    
+## jobunknown                    1.551e-01  6.241e-01   0.248  0.80377    
+## maritalmarried               -4.307e-01  1.702e-01  -2.531  0.01139 *  
+## maritalsingle                -8.825e-02  1.993e-01  -0.443  0.65785    
+## educationsecondary            8.748e-02  2.002e-01   0.437  0.66217    
+## educationtertiary             3.624e-01  2.342e-01   1.547  0.12180    
+## educationunknown             -2.931e-01  3.644e-01  -0.804  0.42124    
+## in_defaultyes                 2.745e-01  4.179e-01   0.657  0.51129    
+## balance                      -4.791e-06  1.856e-05  -0.258  0.79630    
+## housing_loanyes              -3.516e-01  1.247e-01  -2.820  0.00480 ** 
+## personal_loanyes             -5.471e-01  1.903e-01  -2.875  0.00404 ** 
+## last_contact_typetelephone   -1.813e-01  2.280e-01  -0.795  0.42652    
+## last_contact_typeunknown     -8.411e-01  1.715e-01  -4.905 9.33e-07 ***
+## contact_count                -7.445e-02  2.806e-02  -2.654  0.00796 ** 
+## days_since_last_contact      -1.209e-03  1.039e-03  -1.163  0.24470    
+## prev_campaigns_contact_count  2.236e-02  3.929e-02   0.569  0.56923    
+## previous_outcomeother         4.540e-01  2.657e-01   1.709  0.08750 .  
+## previous_outcomesuccess       2.064e+00  2.876e-01   7.176 7.20e-13 ***
+## previous_outcomeunknown      -4.089e-01  3.174e-01  -1.288  0.19764    
+## ---
+## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 ## 
-## Degrees of Freedom: 3390 Total (i.e. Null);  3361 Residual
-## Null Deviance:	    2424 
-## Residual Deviance: 2155 	AIC: 2215
+## (Dispersion parameter for binomial family taken to be 1)
+## 
+##     Null deviance: 2424.3  on 3390  degrees of freedom
+## Residual deviance: 2154.9  on 3361  degrees of freedom
+## AIC: 2214.9
+## 
+## Number of Fisher Scoring iterations: 5
 ```
 
-Boosted Logistic Regression
+### Evaluation
+
+Let's determine which model is the best predictor of whether a person will become an account holder.
+
+#### Random Forest
 
 
 ```r
-#system.time(blogit.fit <- train(formula = formula,
-#                                data = training,
-#                                method = "LogitBoost",
-#                                metric = metric,
-#                                trControl = fitControl)
-#            )
-
-#plot(blogit.fit)
-```
-
-Evaluation
-
-
-```r
-# Random Forest
+# Generate confusion matrix on training data
 rf.pred <- predict(rf.fit, newdata = training)
-confusionMatrix(data = rf.pred, reference = training$y, positive = "yes")
+confusionMatrix(data = rf.pred, reference = training$y)
 ```
 
 ```
@@ -418,22 +538,23 @@ confusionMatrix(data = rf.pred, reference = training$y, positive = "yes")
 ##                   Kappa : 0.9986     
 ##  Mcnemar's Test P-Value : 1          
 ##                                      
-##             Sensitivity : 0.9974     
-##             Specificity : 1.0000     
-##          Pos Pred Value : 1.0000     
-##          Neg Pred Value : 0.9997     
-##              Prevalence : 0.1153     
-##          Detection Rate : 0.1150     
-##    Detection Prevalence : 0.1150     
+##             Sensitivity : 1.0000     
+##             Specificity : 0.9974     
+##          Pos Pred Value : 0.9997     
+##          Neg Pred Value : 1.0000     
+##              Prevalence : 0.8847     
+##          Detection Rate : 0.8847     
+##    Detection Prevalence : 0.8850     
 ##       Balanced Accuracy : 0.9987     
 ##                                      
-##        'Positive' Class : yes        
+##        'Positive' Class : no         
 ## 
 ```
 
 ```r
+# Generate confusion matrix on testing data
 rf.pred.test <- predict(rf.fit, newdata = testing)
-confusionMatrix(data = rf.pred.test, reference = testing$y, positive = "yes")
+confusionMatrix(data = rf.pred.test, reference = testing$y)
 ```
 
 ```
@@ -441,38 +562,67 @@ confusionMatrix(data = rf.pred.test, reference = testing$y, positive = "yes")
 ## 
 ##           Reference
 ## Prediction  no yes
-##        no  987 102
-##        yes  13  28
+##        no  986 106
+##        yes  14  24
 ##                                           
-##                Accuracy : 0.8982          
-##                  95% CI : (0.8791, 0.9152)
+##                Accuracy : 0.8938          
+##                  95% CI : (0.8744, 0.9112)
 ##     No Information Rate : 0.885           
-##     P-Value [Acc > NIR] : 0.08651         
+##     P-Value [Acc > NIR] : 0.1886          
 ##                                           
-##                   Kappa : 0.2882          
-##  Mcnemar's Test P-Value : 2.286e-16       
+##                   Kappa : 0.2465          
+##  Mcnemar's Test P-Value : <2e-16          
 ##                                           
-##             Sensitivity : 0.21538         
-##             Specificity : 0.98700         
-##          Pos Pred Value : 0.68293         
-##          Neg Pred Value : 0.90634         
-##              Prevalence : 0.11504         
-##          Detection Rate : 0.02478         
-##    Detection Prevalence : 0.03628         
-##       Balanced Accuracy : 0.60119         
+##             Sensitivity : 0.9860          
+##             Specificity : 0.1846          
+##          Pos Pred Value : 0.9029          
+##          Neg Pred Value : 0.6316          
+##              Prevalence : 0.8850          
+##          Detection Rate : 0.8726          
+##    Detection Prevalence : 0.9664          
+##       Balanced Accuracy : 0.5853          
 ##                                           
-##        'Positive' Class : yes             
+##        'Positive' Class : no              
 ## 
 ```
 
-```r
-# Regularized Discriminant Analysis
-#rda.pred <- predict(rda.fit, newdata = training)
-#confusionMatrix(rda.pred, training$y)
+The above analysis shows that the random forest model performs handsomely on the training data but loses specificity when applied to the test set. This is driven by the unbalanced distribution of the target variable. The optimized version of this model, presented below, is designed to overcome this challenge.
 
-# Gradient Boosted Trees
-gbm.pred <- predict(gbm.fit, newdata = training)
-confusionMatrix(data = gbm.pred, reference = training$y, positive = "yes")
+
+```r
+# Generate class probabilities
+rf.pred.test.probs <- predict(rf.fit, newdata = testing, type = "prob")
+
+# Generate ROC Curve
+rf.rocCurve <- roc(response = testing$y,
+                predictor = rf.pred.test.probs[,"yes"],
+                levels = rev(levels(testing$y)))
+
+plot(rf.rocCurve, 
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+```
+
+![](bank_marketing_model_files/figure-html/rf_roc-1.png) 
+
+```
+## 
+## Call:
+## roc.default(response = testing$y, predictor = rf.pred.test.probs[,     "yes"], levels = rev(levels(testing$y)))
+## 
+## Data: rf.pred.test.probs[, "yes"] in 130 controls (testing$y yes) > 1000 cases (testing$y no).
+## Area under the curve: 0.7029
+```
+
+#### Random Forest Model -- Optimized for Imbalanced Target Variable Distribution
+
+
+```r
+# Generate confusion matrix on TRAINING data
+rf.optimized.pred <- predict(rf.optimized, newdata = training)
+confusionMatrix(data = rf.optimized.pred, reference = training$y)
 ```
 
 ```
@@ -480,114 +630,793 @@ confusionMatrix(data = gbm.pred, reference = training$y, positive = "yes")
 ## 
 ##           Reference
 ## Prediction   no  yes
-##        no  2972  334
-##        yes   28   57
+##        no  2659    0
+##        yes  341  391
 ##                                           
-##                Accuracy : 0.8932          
-##                  95% CI : (0.8824, 0.9034)
+##                Accuracy : 0.8994          
+##                  95% CI : (0.8888, 0.9094)
 ##     No Information Rate : 0.8847          
-##     P-Value [Acc > NIR] : 0.06153         
+##     P-Value [Acc > NIR] : 0.003404        
 ##                                           
-##                   Kappa : 0.2068          
-##  Mcnemar's Test P-Value : < 2e-16         
+##                   Kappa : 0.6426          
+##  Mcnemar's Test P-Value : < 2.2e-16       
 ##                                           
-##             Sensitivity : 0.14578         
-##             Specificity : 0.99067         
-##          Pos Pred Value : 0.67059         
-##          Neg Pred Value : 0.89897         
-##              Prevalence : 0.11531         
-##          Detection Rate : 0.01681         
-##    Detection Prevalence : 0.02507         
-##       Balanced Accuracy : 0.56822         
+##             Sensitivity : 0.8863          
+##             Specificity : 1.0000          
+##          Pos Pred Value : 1.0000          
+##          Neg Pred Value : 0.5342          
+##              Prevalence : 0.8847          
+##          Detection Rate : 0.7841          
+##    Detection Prevalence : 0.7841          
+##       Balanced Accuracy : 0.9432          
 ##                                           
-##        'Positive' Class : yes             
+##        'Positive' Class : no              
 ## 
 ```
 
 ```r
-# Partial Least Squares
-#pls.pred <- predict(pls.fit, newdata = training)
-#confusionMatrix(pls.pred, training$y)
-
-# Naive Bayes
-#nb.pred <- predict(nb.fit, newdata = training)
-#confusionMatrix(nb.pred, training$y)
-
-# Neural Network
-#nn.pred <- predict(nn.fit, newdata = training)
-#confusionMatrix(nn.pred, training$y)
-
-# Boosted Logistic Regression
-#blogit.pred <- predict(blogit.fit, newdata = training)
-#confusionMatrix(blogit.pred, training$y)
-
-#print(rf.fit)
+# Generate confusion matric on TESTING data
+rf.optimized.pred.test <- predict(rf.optimized, newdata = testing)
+confusionMatrix(data = rf.optimized.pred.test, reference = testing$y)
 ```
 
-Variable Importance
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction  no yes
+##        no  686  52
+##        yes 314  78
+##                                           
+##                Accuracy : 0.6761          
+##                  95% CI : (0.6479, 0.7033)
+##     No Information Rate : 0.885           
+##     P-Value [Acc > NIR] : 1               
+##                                           
+##                   Kappa : 0.1524          
+##  Mcnemar's Test P-Value : <2e-16          
+##                                           
+##             Sensitivity : 0.6860          
+##             Specificity : 0.6000          
+##          Pos Pred Value : 0.9295          
+##          Neg Pred Value : 0.1990          
+##              Prevalence : 0.8850          
+##          Detection Rate : 0.6071          
+##    Detection Prevalence : 0.6531          
+##       Balanced Accuracy : 0.6430          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+Relative to the original random forest, we sacrifice a little bit of overall accuracy on the optimized version, but _significantly_ improve our ability to detect and predict the minority class, in this case, account subscriptions.
+
+
+```r
+# Generate class probabilities
+rf.optimized.pred.test.probs <- predict(rf.optimized, newdata = testing, type = "prob")
+
+# Generate ROC curves
+rf.optimized.rocCurve <- roc(response = testing$y,
+                             predictor = rf.optimized.pred.test.probs[,"yes"],
+                             levels = rev(levels(testing$y)))
+
+plot(rf.optimized.rocCurve,
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+```
+
+![](bank_marketing_model_files/figure-html/rf.opt_roc-1.png) 
+
+```
+## 
+## Call:
+## roc.default(response = testing$y, predictor = rf.optimized.pred.test.probs[,     "yes"], levels = rev(levels(testing$y)))
+## 
+## Data: rf.optimized.pred.test.probs[, "yes"] in 130 controls (testing$y yes) > 1000 cases (testing$y no).
+## Area under the curve: 0.7092
+```
+
+#### Gradient Boosted Trees
+
+
+```r
+# Generate confusion matrix on TRAINING data
+gbm.pred <- predict(gbm.fit, newdata = training)
+confusionMatrix(data = gbm.pred, reference = training$y)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction   no  yes
+##        no  2974  333
+##        yes   26   58
+##                                           
+##                Accuracy : 0.8941          
+##                  95% CI : (0.8833, 0.9043)
+##     No Information Rate : 0.8847          
+##     P-Value [Acc > NIR] : 0.0439          
+##                                           
+##                   Kappa : 0.2121          
+##  Mcnemar's Test P-Value : <2e-16          
+##                                           
+##             Sensitivity : 0.9913          
+##             Specificity : 0.1483          
+##          Pos Pred Value : 0.8993          
+##          Neg Pred Value : 0.6905          
+##              Prevalence : 0.8847          
+##          Detection Rate : 0.8770          
+##    Detection Prevalence : 0.9752          
+##       Balanced Accuracy : 0.5698          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+```r
+# Generate confusion matrix on TESTING data
+gbm.pred.test <- predict(gbm.fit, newdata = testing)
+confusionMatrix(data = gbm.pred.test, reference = testing$y)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction  no yes
+##        no  990 101
+##        yes  10  29
+##                                           
+##                Accuracy : 0.9018          
+##                  95% CI : (0.8829, 0.9185)
+##     No Information Rate : 0.885           
+##     P-Value [Acc > NIR] : 0.04002         
+##                                           
+##                   Kappa : 0.3064          
+##  Mcnemar's Test P-Value : < 2e-16         
+##                                           
+##             Sensitivity : 0.9900          
+##             Specificity : 0.2231          
+##          Pos Pred Value : 0.9074          
+##          Neg Pred Value : 0.7436          
+##              Prevalence : 0.8850          
+##          Detection Rate : 0.8761          
+##    Detection Prevalence : 0.9655          
+##       Balanced Accuracy : 0.6065          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+The analysis above demonstrates the same challenge that plagued the original random forest model. We lose our ability to detect and predict account subscriptions on the test data, despite a well-fitting model on the training data.
+
+
+```r
+# Generate class probabilities
+gbm.pred.test.probs <- predict(gbm.fit, newdata = testing, type = "prob")
+
+# Generate ROC curve
+gbm.rocCurve <- roc(response = testing$y,
+                predictor = gbm.pred.test.probs[,"yes"],
+                levels = rev(levels(testing$y)))
+
+plot(gbm.rocCurve, 
+     print.thres = c(0.5, 0.2, 0.14, 0.13, 0.12), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+```
+
+![](bank_marketing_model_files/figure-html/gbm_roc-1.png) 
+
+```
+## 
+## Call:
+## roc.default(response = testing$y, predictor = gbm.pred.test.probs[,     "yes"], levels = rev(levels(testing$y)))
+## 
+## Data: gbm.pred.test.probs[, "yes"] in 130 controls (testing$y yes) > 1000 cases (testing$y no).
+## Area under the curve: 0.7372
+```
+
+#### Logistic Regression
+
+
+```r
+# Generate class probabilities first
+glm.pred <- predict(glmfit, newdata = training, type = "response")
+
+# Then, convert probabilities into class predictions based on a threshold set using trial and error
+threshold <- 0.15
+glm.pred.class <- ifelse(glm.pred < threshold, levels(training$y)[1], levels(training$y)[2])
+
+glm.pred.test <- predict(glmfit, newdata = testing, type = "response")
+glm.pred.test.class <- ifelse(glm.pred.test < threshold, levels(testing$y)[1], levels(testing$y)[2])
+
+# Generate confusion matrix on TRAINING data
+confusionMatrix(data = glm.pred.class, reference = training$y)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction   no  yes
+##        no  2461  221
+##        yes  539  170
+##                                           
+##                Accuracy : 0.7759          
+##                  95% CI : (0.7615, 0.7898)
+##     No Information Rate : 0.8847          
+##     P-Value [Acc > NIR] : 1               
+##                                           
+##                   Kappa : 0.1885          
+##  Mcnemar's Test P-Value : <2e-16          
+##                                           
+##             Sensitivity : 0.8203          
+##             Specificity : 0.4348          
+##          Pos Pred Value : 0.9176          
+##          Neg Pred Value : 0.2398          
+##              Prevalence : 0.8847          
+##          Detection Rate : 0.7257          
+##    Detection Prevalence : 0.7909          
+##       Balanced Accuracy : 0.6276          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+```r
+# Generate confusion matrix on TESTING data
+confusionMatrix(data = glm.pred.test.class, reference = testing$y)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction  no yes
+##        no  814  58
+##        yes 186  72
+##                                           
+##                Accuracy : 0.7841          
+##                  95% CI : (0.7589, 0.8077)
+##     No Information Rate : 0.885           
+##     P-Value [Acc > NIR] : 1               
+##                                           
+##                   Kappa : 0.2575          
+##  Mcnemar's Test P-Value : 4.281e-16       
+##                                           
+##             Sensitivity : 0.8140          
+##             Specificity : 0.5538          
+##          Pos Pred Value : 0.9335          
+##          Neg Pred Value : 0.2791          
+##              Prevalence : 0.8850          
+##          Detection Rate : 0.7204          
+##    Detection Prevalence : 0.7717          
+##       Balanced Accuracy : 0.6839          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+Let's generate an ROC Curve for our Logistic Regression model
+
+
+```r
+# Generate ROC curve
+glm.rocCurve <- roc(response = testing$y,
+                predictor = glm.pred.test,
+                levels = rev(levels(testing$y)))
+
+plot(glm.rocCurve, 
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+```
+
+![](bank_marketing_model_files/figure-html/glm_roc-1.png) 
+
+```
+## 
+## Call:
+## roc.default(response = testing$y, predictor = glm.pred.test,     levels = rev(levels(testing$y)))
+## 
+## Data: glm.pred.test in 130 controls (testing$y yes) > 1000 cases (testing$y no).
+## Area under the curve: 0.7388
+```
+
+Revising the logistic regression model to focus on what matters
+
+Using ANOVA and trial and error, we've honed down the list of predictors to those that were statistically significant (at least at the 5% significance level).
+
+
+```r
+# build new model
+glm.revised <- glm(y ~ age + 
+                   marital + 
+                   housing_loan + 
+                   personal_loan + 
+                   last_contact_type + 
+                   previous_outcome + 
+                   contact_count, 
+               data = training, 
+               family = "binomial")
+
+# verify statistical significance
+summary(glm.revised)
+```
+
+```
+## 
+## Call:
+## glm(formula = y ~ age + marital + housing_loan + personal_loan + 
+##     last_contact_type + previous_outcome + contact_count, family = "binomial", 
+##     data = training)
+## 
+## Deviance Residuals: 
+##     Min       1Q   Median       3Q      Max  
+## -1.7695  -0.5274  -0.4119  -0.2897   3.0261  
+## 
+## Coefficients:
+##                             Estimate Std. Error z value Pr(>|z|)    
+## (Intercept)                -1.594408   0.368415  -4.328 1.51e-05 ***
+## age                         0.012544   0.005875   2.135 0.032762 *  
+## maritalmarried             -0.440270   0.167421  -2.630 0.008545 ** 
+## maritalsingle              -0.032704   0.195576  -0.167 0.867196    
+## housing_loanyes            -0.432200   0.119906  -3.604 0.000313 ***
+## personal_loanyes           -0.538568   0.187909  -2.866 0.004155 ** 
+## last_contact_typetelephone -0.181188   0.223075  -0.812 0.416661    
+## last_contact_typeunknown   -0.888427   0.169551  -5.240 1.61e-07 ***
+## previous_outcomeother       0.460335   0.262371   1.755 0.079342 .  
+## previous_outcomesuccess     2.142036   0.275760   7.768 7.99e-15 ***
+## previous_outcomeunknown    -0.205877   0.176864  -1.164 0.244406    
+## contact_count              -0.076404   0.028053  -2.724 0.006459 ** 
+## ---
+## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+## 
+## (Dispersion parameter for binomial family taken to be 1)
+## 
+##     Null deviance: 2424.3  on 3390  degrees of freedom
+## Residual deviance: 2175.2  on 3379  degrees of freedom
+## AIC: 2199.2
+## 
+## Number of Fisher Scoring iterations: 5
+```
+
+```r
+anova(glm.revised)
+```
+
+```
+## Analysis of Deviance Table
+## 
+## Model: binomial, link: logit
+## 
+## Response: y
+## 
+## Terms added sequentially (first to last)
+## 
+## 
+##                   Df Deviance Resid. Df Resid. Dev
+## NULL                               3390     2424.3
+## age                1    7.194      3389     2417.1
+## marital            2   22.490      3387     2394.7
+## housing_loan       1   28.217      3386     2366.4
+## personal_loan      1   14.801      3385     2351.6
+## last_contact_type  2   56.656      3383     2295.0
+## previous_outcome   3  110.772      3380     2184.2
+## contact_count      1    8.979      3379     2175.2
+```
+
+On its own, the GLM has proven to be a weak predictive model for this data. However, we can tune the threshold for class predictions to improve model quality metrics. In our case, specificity is important, as well as sensitivity. So, we'll try a bunch of class probability thresholds and see the impact on both of these metrics.
+
+
+```r
+# Generate class probabilities first
+glm.revised.pred.probs.train <- predict(glm.revised, 
+                                        newdata = training, 
+                                        type = "response")
+
+# the thresholds to tune over
+thresholds <- seq(0.05, 0.25, by = 0.01)
+
+# generate sensitivities for each threshold
+glm.thresholds.train.sensitivities <- sapply(thresholds, function(x) {
+    
+    # Convert probabilities into class predictions
+    classPreds <- ifelse(glm.revised.pred.probs.train < x, 
+                         levels(training$y)[1], 
+                         levels(training$y)[2])
+    
+    # Calculate sensitivity
+    sensitivity(data = factor(classPreds), reference = training$y)
+})
+
+# generate specificities for each threshold
+glm.thresholds.train.specificities <- sapply(thresholds, function(x) {
+    # Convert probabilities into class predictions
+    classPreds <- ifelse(glm.revised.pred.probs.train < x, 
+                         levels(training$y)[1], 
+                         levels(training$y)[2])
+    
+    # Calculate sensitivity
+    specificity(data = factor(classPreds), reference = training$y)
+})
+
+# organize data for plotting
+glm.thresholds <- data.frame(threshold = thresholds,
+                             sens = glm.thresholds.train.sensitivities, 
+                             spec = glm.thresholds.train.specificities)
+
+# plot the data
+ggplot(data = glm.thresholds, aes(x = threshold)) +
+    geom_line(aes(y = sens, color = "Sensitivity")) +
+    geom_line(aes(y = spec, color = "Specificity")) +
+    labs(title = "Sensitivity and Specificity at Various Class Probability Thresholds",
+         x = "Class Probablity Threshold",
+         y = "Sensitivity and Specificity")
+```
+
+![](bank_marketing_model_files/figure-html/glm_tuning-1.png) 
+
+According to the analysis above, an acceptable balance between the 2 metrics lies at the class probablity threshold of 10-12%. Let's choose 10% and evaluate on the testing data.
+    
+
+```r
+glm.revised.threshold <- 0.10
+
+glm.revised.pred.probs.test <- predict(glm.revised, 
+                                       newdata = testing, 
+                                       type = "response")
+
+glm.revised.pred.test.class <- ifelse(glm.revised.pred.probs.test < glm.revised.threshold, 
+                                      levels(testing$y)[1], 
+                                      levels(testing$y)[2])
+
+# Generate confusion matrix on TESTING data
+confusionMatrix(data = glm.revised.pred.test.class, reference = testing$y)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction  no yes
+##        no  542  33
+##        yes 458  97
+##                                          
+##                Accuracy : 0.5655         
+##                  95% CI : (0.536, 0.5946)
+##     No Information Rate : 0.885          
+##     P-Value [Acc > NIR] : 1              
+##                                          
+##                   Kappa : 0.119          
+##  Mcnemar's Test P-Value : <2e-16         
+##                                          
+##             Sensitivity : 0.5420         
+##             Specificity : 0.7462         
+##          Pos Pred Value : 0.9426         
+##          Neg Pred Value : 0.1748         
+##              Prevalence : 0.8850         
+##          Detection Rate : 0.4796         
+##    Detection Prevalence : 0.5088         
+##       Balanced Accuracy : 0.6441         
+##                                          
+##        'Positive' Class : no             
+## 
+```
+
+As shown above, this version of the logistic regression model, while not perfect, better detects, and predicts the minorty class -- new account subscribers.
+
+#### Taking a Step Back
+
+What percent of `yes` values in the test set are missed by _all_ the models we are considering?
+
+
+```r
+all.preds.train <- data.frame(truth = training$y,
+                              rf.reg = rf.pred,
+                              rf.opt = rf.optimized.pred,
+                              gbm = gbm.pred,
+                              glm = glm.pred.class)
+
+all.preds.test <- data.frame(truth = testing$y,
+                             rf.reg = rf.pred.test, 
+                             rf.opt = rf.optimized.pred.test,
+                             gbm = gbm.pred.test, 
+                             glm = glm.pred.test.class)
+
+# Define procedure for calculating missed values
+getMissed <- function(df) {
+    yesOnly <- df[df$truth == "yes",]
+    return (apply(yesOnly[,c(2:ncol(df))], 1, function(row) {
+        
+        ifelse(length(which(row == "no")) == 0, 1, 0)
+    }))
+}
+
+
+# training
+allMissed.train <- getMissed(all.preds.train)
+sum(allMissed.train)
+```
+
+```
+## [1] 56
+```
+
+```r
+sum(allMissed.train) / length(allMissed.train)
+```
+
+```
+## [1] 0.1432225
+```
+
+```r
+# testing
+allMissed <- getMissed(all.preds.test)
+sum(allMissed)
+```
+
+```
+## [1] 20
+```
+
+```r
+sum(allMissed) / length(allMissed)
+```
+
+```
+## [1] 0.1538462
+```
+
+So, the maximum level of accuracy on `yes` values we can expect (for any of _our_ models) is about 85%.
+
+#### Training an ensemble
+
+Since no model is perfect and each are able to predict some portion of the test cases, could we improve our accuracy and specificity by combining these models? Let's try a decision tree across the predictions of the models we have just built.
+
+
+```r
+decision.tree <- rpart(truth ~ rf.opt + gbm + glm, 
+                       data = all.preds.train, 
+                       method = "class")
+```
+
+Here is what our tree looks like using the default parameters
+
+
+```r
+plot(decision.tree, 
+     uniform = TRUE, 
+     main = "Classification Tree for Our Classification Model")
+
+text(decision.tree, use.n = TRUE, all = TRUE, cex = 0.8)
+```
+
+![](bank_marketing_model_files/figure-html/combined_tree-1.png) 
+
+Below, we generate predictions by combining all of our models. Note that we exclude the original random forest model because it seems to over-power all the others. Including the original random forest model ensures that we sucuumb to the original problem of imbalanced target variable distribution. 
+
+
+```r
+pred.train <- predict(decision.tree, 
+                      newdata = all.preds.train[ , c(3:ncol(all.preds.train))],
+                      type = "class")
+
+pred.test <- predict(decision.tree,
+                     newdata = all.preds.test[ , c(3:ncol(all.preds.test))],
+                     type = "class")
+
+# Generate a confusion matrix on TRAINING data
+confusionMatrix(data = pred.train, reference = all.preds.train$truth)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction   no  yes
+##        no  2836  114
+##        yes  164  277
+##                                          
+##                Accuracy : 0.918          
+##                  95% CI : (0.9083, 0.927)
+##     No Information Rate : 0.8847         
+##     P-Value [Acc > NIR] : 1.213e-10      
+##                                          
+##                   Kappa : 0.6193         
+##  Mcnemar's Test P-Value : 0.003295       
+##                                          
+##             Sensitivity : 0.9453         
+##             Specificity : 0.7084         
+##          Pos Pred Value : 0.9614         
+##          Neg Pred Value : 0.6281         
+##              Prevalence : 0.8847         
+##          Detection Rate : 0.8363         
+##    Detection Prevalence : 0.8699         
+##       Balanced Accuracy : 0.8269         
+##                                          
+##        'Positive' Class : no             
+## 
+```
+
+```r
+# Generate a confusion matrix on TESTING data
+confusionMatrix(data = pred.test, reference = all.preds.test$truth)
+```
+
+```
+## Confusion Matrix and Statistics
+## 
+##           Reference
+## Prediction  no yes
+##        no  802  79
+##        yes 198  51
+##                                           
+##                Accuracy : 0.7549          
+##                  95% CI : (0.7287, 0.7797)
+##     No Information Rate : 0.885           
+##     P-Value [Acc > NIR] : 1               
+##                                           
+##                   Kappa : 0.139           
+##  Mcnemar's Test P-Value : 1.342e-12       
+##                                           
+##             Sensitivity : 0.8020          
+##             Specificity : 0.3923          
+##          Pos Pred Value : 0.9103          
+##          Neg Pred Value : 0.2048          
+##              Prevalence : 0.8850          
+##          Detection Rate : 0.7097          
+##    Detection Prevalence : 0.7796          
+##       Balanced Accuracy : 0.5972          
+##                                           
+##        'Positive' Class : no              
+## 
+```
+
+Surprisingly, the analysis the above shows a _worse_ performance on the testing data. Based on specificity (our ability to detect and predict the `yes` case), the optimized version of the random forest model is our best model.
+
+### Variable Importance
+
+Below, we list out the most important variables for each model.
 
 
 ```r
 # variable importance
-varImp(rf.fit)
+head(varImp(rf.fit))
 ```
 
 ```
-## rf variable importance
+## $importance
+##                                  Overall
+## age                           70.1534743
+## jobblue-collar                 5.9583257
+## jobentrepreneur                1.8553986
+## jobhousemaid                   1.4829519
+## jobmanagement                  5.6902335
+## jobretired                     2.0459910
+## jobself-employed               2.2882180
+## jobservices                    2.7390326
+## jobstudent                     0.3321299
+## jobtechnician                  5.9566004
+## jobunemployed                  1.7185766
+## jobunknown                     0.0000000
+## maritalmarried                 7.2275979
+## maritalsingle                  5.3025606
+## educationsecondary             7.8528404
+## educationtertiary              6.2032803
+## educationunknown               1.3420568
+## in_defaultyes                  1.2680224
+## balance                      100.0000000
+## housing_loanyes                9.3631987
+## personal_loanyes               5.2662123
+## last_contact_typetelephone     3.2545467
+## last_contact_typeunknown       4.3051538
+## contact_count                 27.9546430
+## days_since_last_contact       21.7764269
+## prev_campaigns_contact_count   9.9901042
+## previous_outcomeother          1.8539618
+## previous_outcomesuccess       20.3666841
+## previous_outcomeunknown        1.0835462
 ## 
-##   only 20 most important variables shown (out of 29)
+## $model
+## [1] "rf"
 ## 
-##                              Overall
-## balance                      100.000
-## age                           70.761
-## contact_count                 28.338
-## days_since_last_contact       21.684
-## previous_outcomesuccess       20.626
-## prev_campaigns_contact_count  10.435
-## housing_loanyes                9.718
-## educationsecondary             8.005
-## maritalmarried                 7.470
-## jobtechnician                  6.268
-## educationtertiary              6.021
-## jobblue-collar                 5.877
-## jobmanagement                  5.778
-## maritalsingle                  5.496
-## personal_loanyes               5.009
-## last_contact_typeunknown       4.459
-## last_contact_typetelephone     3.237
-## jobservices                    2.893
-## jobself-employed               2.399
-## jobretired                     2.077
+## $calledFrom
+## [1] "varImp"
 ```
 
 ```r
-varImp(gbm.fit)
+head(varImp(rf.optimized))
 ```
 
 ```
-## gbm variable importance
+## $importance
+##                                  Overall
+## age                           86.3971500
+## jobblue-collar                 7.2637486
+## jobentrepreneur                3.2037536
+## jobhousemaid                   2.1066891
+## jobmanagement                  6.6631424
+## jobretired                     4.5063097
+## jobself-employed               3.1201180
+## jobservices                    3.9227104
+## jobstudent                     0.8914915
+## jobtechnician                  7.4227514
+## jobunemployed                  2.2948723
+## jobunknown                     0.0000000
+## maritalmarried                10.0576975
+## maritalsingle                  7.0996412
+## educationsecondary             9.6294572
+## educationtertiary              8.0072088
+## educationunknown               2.0902149
+## in_defaultyes                  1.6261589
+## balance                      100.0000000
+## housing_loanyes               12.6802596
+## personal_loanyes               6.6359790
+## last_contact_typetelephone     4.9419126
+## last_contact_typeunknown       8.7024016
+## contact_count                 35.5028497
+## days_since_last_contact       35.6635403
+## prev_campaigns_contact_count  19.2613131
+## previous_outcomeother          2.8756337
+## previous_outcomesuccess       28.9905465
+## previous_outcomeunknown        3.5664449
 ## 
-##   only 20 most important variables shown (out of 29)
+## $model
+## [1] "custom"
 ## 
-##                               Overall
-## age                          100.0000
-## previous_outcomesuccess       80.5372
-## days_since_last_contact       58.2188
-## balance                       51.4175
-## prev_campaigns_contact_count  29.2377
-## last_contact_typeunknown      16.9544
-## contact_count                  9.7434
-## maritalmarried                 8.7825
-## housing_loanyes                8.3277
-## previous_outcomeother          7.2125
-## educationtertiary              5.2445
-## jobretired                     4.8354
-## personal_loanyes               3.2247
-## jobstudent                     2.1367
-## jobmanagement                  1.8882
-## jobhousemaid                   1.4028
-## last_contact_typetelephone     1.2662
-## jobtechnician                  0.6547
-## in_defaultyes                  0.5943
-## maritalsingle                  0.0000
+## $calledFrom
+## [1] "varImp"
+```
+
+```r
+head(varImp(gbm.fit))
+```
+
+```
+## $importance
+##                                   Overall
+## age                           78.31142690
+## jobblue-collar                 2.26333821
+## jobentrepreneur                0.28701623
+## jobhousemaid                   0.66220835
+## jobmanagement                  2.59820780
+## jobretired                     3.64003300
+## jobself-employed               1.04156320
+## jobservices                    0.15772163
+## jobstudent                     1.11478861
+## jobtechnician                  1.25125923
+## jobunemployed                  0.07939544
+## jobunknown                     0.03645677
+## maritalmarried                 8.45015888
+## maritalsingle                  0.60271236
+## educationsecondary             3.43877003
+## educationtertiary              9.31125589
+## educationunknown               0.30582581
+## in_defaultyes                  0.41795071
+## balance                       65.81351312
+## housing_loanyes               12.21166295
+## personal_loanyes               3.59813736
+## last_contact_typetelephone     1.71069868
+## last_contact_typeunknown      17.52855977
+## contact_count                 13.19903088
+## days_since_last_contact       55.89455388
+## prev_campaigns_contact_count  26.37768144
+## previous_outcomeother          6.61228757
+## previous_outcomesuccess      100.00000000
+## previous_outcomeunknown        0.00000000
+## 
+## $model
+## [1] "gbm"
+## 
+## $calledFrom
+## [1] "varImp"
 ```

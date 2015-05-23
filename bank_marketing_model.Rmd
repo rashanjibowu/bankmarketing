@@ -13,18 +13,40 @@ output:
 
 This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account.
 
+### Preparing the environment
+
 Require necessary packages
 
 ```{r load_packages}
 
-library(plyr)
-library(caret)
-library(ggplot2)
-library(lattice)
+require(plyr, quietly = TRUE, warn.conflicts = FALSE)
+require(caret, quietly = TRUE, warn.conflicts = FALSE)
+require(ggplot2, quietly = TRUE, warn.conflicts = FALSE)
+require(lattice, quietly = TRUE, warn.conflicts = FALSE)
+require(doParallel, quietly = TRUE, warn.conflicts = FALSE)
+suppressWarnings(require(pROC, quietly = TRUE, warn.conflicts = FALSE))
+require(reshape2, quietly = TRUE, warn.conflicts = FALSE)
+suppressWarnings(require(randomForest, quietly = TRUE, warn.conflicts = FALSE))
+require(rpart, quietly = TRUE, warn.conflicts = FALSE)
 
 ```
 
-Load and summarize the data
+Set up parallel processing
+
+```{r setup_parallel}
+
+cores = detectCores()
+
+# use all but 1 core to process data
+if (cores > 1) {
+    cores <- cores - 1
+}
+
+registerDoParallel(cores = cores)
+
+```
+
+Load and check the data
 
 ```{r load_summarize}
 
@@ -34,7 +56,9 @@ summary(data)
 
 ```
 
-Clean the data
+### Clean the data
+
+Based on the details from the data source, let's rename the variables to provide better context.
 
 ```{r clean}
 
@@ -51,6 +75,12 @@ data <- rename(data, c("default" = "in_default",
                        "poutcome" = "previous_outcome")
        )
 
+```
+
+We should also remove variables that ought not to be part of the modelling. For example, we won't knw in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
+
+```{r remove_unnecessary}
+
 # remove data that should have no bearing (time of last contact and duration)
 data <- data[, -(10:12)]
 
@@ -59,6 +89,22 @@ names(data)
 ```
 
 #### Exploratory Data Analysis
+
+Histogram of target variable
+
+```{r target_distribution}
+
+ggplot(data = data, aes(y)) + geom_histogram()
+
+```
+
+The distribution of the target variable is quite unbalanced. We'll need to address this later when we get to the model building stage.
+
+```{r}
+
+table(data$y)
+
+```
 
 Relationship with Age
 
@@ -78,7 +124,7 @@ g + geom_point()
 
 ```
 
-Relationship with Balance
+Relationship with Account Balance
 
 ```{r balanceage}
 
@@ -90,13 +136,9 @@ g + geom_point()
 Let's try the following models:
 
 1. Random Forest Model
-2. Regularized Discriminant Analysis
-3. Gradient Boosted Trees
-4. Partial Least Squares
-5. Naive Bayes
-6. Neural Network
-7. Logistic Regression
-8. Boosted Logistic Regression 
+2. Optimized version of Random Forest (to deal with imbalanced class distribution in target variable)
+3. Gradient Boosted Machines
+4. Logistic Regression
 
 Partition the Data
 
@@ -129,178 +171,527 @@ metric <- c("ROC")
 
 ```
 
-Random Forest
+Random Forest Model
 
 ```{r train_rf, cache=TRUE}
 
-system.time(rf.fit <- train(y ~., 
-                            data = training, 
-                            method = "rf",
-                            trControl = fitControl,
-                            metric = metric
-                            )
-            )
+rf.fit <- train(y ~., 
+                data = training, 
+                method = "rf",
+                trControl = fitControl,
+                metric = metric
+                )
+            
+```
 
-ggplot(rf.fit) + theme(legend.position = "top")
+Optimized Random Forest Model
+
+This optimization procedure is adapted from Max Kuhn, who details the procedure [here](http://topepo.github.io/caret/custom_models.html)
+
+```{r revised_rf}
+
+## Get the model code for the original random forest method:
+thresh_code <- getModelInfo("rf", regex = FALSE)[[1]]
+thresh_code$type <- c("Classification")
+
+## Add the threshold as another tuning parameter
+thresh_code$parameters <- data.frame(parameter = c("mtry", "threshold"),
+                                     class = c("numeric", "numeric"),
+                                     label = c("#Randomly Selected Predictors",
+                                               "Probability Cutoff"))
+## The default tuning grid code:
+thresh_code$grid <- function(x, y, len = NULL) {
+  p <- ncol(x)
+  expand.grid(mtry = floor(sqrt(p)),
+              threshold = seq(.5, .99, by = .01))
+  }
+
+## Here we fit a single random forest model (with a fixed mtry)
+## and loop over the threshold values to get predictions from the same
+## randomForest model.
+thresh_code$loop = function(grid) {
+                 library(plyr)
+                 loop <- ddply(grid, c("mtry"),
+                               function(x) c(threshold = max(x$threshold)))
+                 submodels <- vector(mode = "list", length = nrow(loop))
+                 for(i in seq(along = loop$threshold)) {
+                   index <- which(grid$mtry == loop$mtry[i])
+                   cuts <- grid[index, "threshold"]
+                   submodels[[i]] <- data.frame(threshold = cuts[cuts != loop$threshold[i]])
+                 }
+                 list(loop = loop, submodels = submodels)
+               }
+
+## Fit the model independent of the threshold parameter
+thresh_code$fit = function(x, y, wts, param, lev, last, classProbs, ...) {
+  if(length(levels(y)) != 2)
+    stop("This works only for 2-class problems")
+  randomForest(x, y, mtry = param$mtry, ...)
+  }
+
+## Now get a probability prediction and use different thresholds to
+## get the predicted class
+thresh_code$predict = function(modelFit, newdata, submodels = NULL) {
+  class1Prob <- predict(modelFit,
+                        newdata,
+                        type = "prob")[, modelFit$obsLevels[1]]
+  ## Raise the threshold for class #1 and a higher level of
+  ## evidence is needed to call it class 1 so it should 
+  ## decrease sensitivity and increase specificity
+  out <- ifelse(class1Prob >= modelFit$tuneValue$threshold,
+                modelFit$obsLevels[1],
+                modelFit$obsLevels[2])
+  if(!is.null(submodels)) {
+    tmp2 <- out
+    out <- vector(mode = "list", length = length(submodels$threshold))
+    out[[1]] <- tmp2
+    for(i in seq(along = submodels$threshold)) {
+      out[[i+1]] <- ifelse(class1Prob >= submodels$threshold[[i]],
+                           modelFit$obsLevels[1],
+                           modelFit$obsLevels[2])
+      }
+    }
+  out
+  }
+
+## The probabilities are always the same but we have to create
+## mulitple versions of the probs to evaluate the data across
+## thresholds
+thresh_code$prob = function(modelFit, newdata, submodels = NULL) {
+  out <- as.data.frame(predict(modelFit, newdata, type = "prob"))
+  if(!is.null(submodels)) {
+    probs <- out
+    out <- vector(mode = "list", length = length(submodels$threshold)+1)
+    out <- lapply(out, function(x) probs)
+    }
+  out
+  }
 
 ```
 
-Regularized Discriminant Analysis
+Optimizing the model
 
-```{r train_lda, cache=TRUE}
+```{r optimize_rf, cache=TRUE}
 
-#system.time(rda.fit <- train(y ~ ., 
- #                            data = training, 
-  #                           method = "rda",
-   #                          metric = metric,
-    #                         trControl = fitControl)
-     #       )
+fourStats <- function (data, lev = levels(data$obs), model = NULL) {
+  ## This code will get use the area under the ROC curve and the
+  ## sensitivity and specificity values using the current candidate
+  ## value of the probability threshold.
+  out <- c(twoClassSummary(data, lev = levels(data$obs), model = NULL))
 
-#plot(rda.fit)
+  ## The best possible model has sensitivity of 1 and specificity of 1. 
+  ## How far are we from that value?
+  coords <- matrix(c(1, 1, out["Spec"], out["Sens"]),
+                   ncol = 2,
+                   byrow = TRUE)
+  colnames(coords) <- c("Spec", "Sens")
+  rownames(coords) <- c("Best", "Current")
+  c(out, Dist = dist(coords)[1])
+}
+
+rf.optimized <- train(y ~ ., data = training,
+              method = thresh_code,
+              ## Minimize the distance to the perfect model
+              metric = "Dist",
+              maximize = FALSE,
+              tuneLength = 20,
+              ntree = 1000,
+              trControl = trainControl(method = "repeatedcv",
+                                       repeats = 5,
+                                       classProbs = TRUE,
+                                       summaryFunction = fourStats))
 
 ```
 
-Gradient Boosted Trees
+Plotting the revised results
 
-```{r train_gbm, cache=TRUE}
+```{r plot_tunable_rf}
 
-grid <- expand.grid(interaction.depth = seq(1, 7, by = 2),
-                    n.trees = seq(100, 1000, by = 50),
-                    shrinkage = c(0.01, 0.1),
+metrics <- rf.optimized$results[, c(2, 4:6)]
+metrics <- melt(metrics, id.vars = "threshold",
+                variable.name = "Resampled",
+                value.name = "Data")
+
+ggplot(metrics, aes(x = threshold, y = Data, color = Resampled)) +
+  geom_line() +
+  ylab("") + xlab("Probability Cutoff") +
+  theme(legend.position = "top")
+
+```
+
+Gradient Boosted Machines
+
+```{r train_gbm}
+
+grid <- expand.grid(interaction.depth = seq(3, 7, by = 2),
+                    n.trees = seq(500, 1000, by = 100),
+                    shrinkage = 0.01,
                     n.minobsinnode = 10)
 
-system.time(gbm.fit <- train(y ~ ., 
-                             data = training, 
-                             method = "gbm", 
-                             trControl = fitControl,
-                             tuneGrid = grid,
-                             metric = metric,
-                             verbose = FALSE)
-            )
+gbm.fit <- train(y ~ ., 
+                 data = training, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 tuneGrid = grid,
+                 metric = metric,
+                 maximize = TRUE,
+                 verbose = FALSE)     
 
-plot(gbm.fit)
-
+# plot the various model performances
 ggplot(gbm.fit) + theme(legend.position = "top")
 
-```
-
-Partial Least Squares Model
-
-```{r train_pls}
-
-#system.time(pls.fit <- train(y ~ ., 
- #                            data = training, 
-  #                           method = "pls",
-   #                          metric = metric
-    #                         )
-     #       )
-
-#plot(pls.fit)
-
-```
-
-Naive Bayes
-
-```{r naive_bayes}
-
-#system.time(nb.fit <- train(formula = formula,
- #                           data = training,
-  #                          method = "nb", 
-   #                         metric = metric, 
-    #                        trControl = fitControl)
-     #       )
-
-#plot(nb.fit)
-
-```
-
-Neural Network
-
-```{r neural_network}
-
-#system.time(nn.fit <- train(formula = formula,
-     #                       data = training,
-    #                        method = "nnet",
-   #                         metric = metric,
-  #                          trControl = fitControl)
- #           )
-
-#plot(nn.fit)
 ```
 
 Logistic Regression
 
 ```{r logisitic_regression}
 
-system.time(glmfit <- glm(y ~ ., data = training, family = "binomial"))
-print(glmfit)
+glmfit <- glm(y ~ ., 
+              data = training, 
+              family = "binomial")
+
+summary(glmfit)
 
 ```
 
-Boosted Logistic Regression
+### Evaluation
 
-```{r boosted_logit}
+Let's determine which model is the best predictor of whether a person will become an account holder.
 
-#system.time(blogit.fit <- train(formula = formula,
-#                                data = training,
-#                                method = "LogitBoost",
-#                                metric = metric,
-#                                trControl = fitControl)
-#            )
+#### Random Forest
 
-#plot(blogit.fit)
+```{r rf_confusion}
 
-```
-
-Evaluation
-
-```{r evaluate}
-
-# Random Forest
+# Generate confusion matrix on training data
 rf.pred <- predict(rf.fit, newdata = training)
-confusionMatrix(data = rf.pred, reference = training$y, positive = "yes")
+confusionMatrix(data = rf.pred, reference = training$y)
 
+# Generate confusion matrix on testing data
 rf.pred.test <- predict(rf.fit, newdata = testing)
-confusionMatrix(data = rf.pred.test, reference = testing$y, positive = "yes")
-
-# Regularized Discriminant Analysis
-#rda.pred <- predict(rda.fit, newdata = training)
-#confusionMatrix(rda.pred, training$y)
-
-# Gradient Boosted Trees
-gbm.pred <- predict(gbm.fit, newdata = training)
-confusionMatrix(data = gbm.pred, reference = training$y, positive = "yes")
-
-gbm.pred.test <- predict(gbm.fit, newdata = training)
-confusionMatrix(data = gbm.pred.test, reference = training$y, positive = "yes")
-
-# Partial Least Squares
-#pls.pred <- predict(pls.fit, newdata = training)
-#confusionMatrix(pls.pred, training$y)
-
-# Naive Bayes
-#nb.pred <- predict(nb.fit, newdata = training)
-#confusionMatrix(nb.pred, training$y)
-
-# Neural Network
-#nn.pred <- predict(nn.fit, newdata = training)
-#confusionMatrix(nn.pred, training$y)
-
-# Boosted Logistic Regression
-#blogit.pred <- predict(blogit.fit, newdata = training)
-#confusionMatrix(blogit.pred, training$y)
-
-#print(rf.fit)
+confusionMatrix(data = rf.pred.test, reference = testing$y)
 
 ```
 
-Variable Importance
+The above analysis shows that the random forest model performs handsomely on the training data but loses specificity when applied to the test set. This is driven by the unbalanced distribution of the target variable. The optimized version of this model, presented below, is designed to overcome this challenge.
+
+```{r rf_roc}
+
+# Generate class probabilities
+rf.pred.test.probs <- predict(rf.fit, newdata = testing, type = "prob")
+
+# Generate ROC Curve
+rf.rocCurve <- roc(response = testing$y,
+                predictor = rf.pred.test.probs[,"yes"],
+                levels = rev(levels(testing$y)))
+
+plot(rf.rocCurve, 
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+
+```
+
+#### Random Forest Model -- Optimized for Imbalanced Target Variable Distribution
+
+```{r rf.opt_confusion}
+
+# Generate confusion matrix on TRAINING data
+rf.optimized.pred <- predict(rf.optimized, newdata = training)
+confusionMatrix(data = rf.optimized.pred, reference = training$y)
+
+# Generate confusion matric on TESTING data
+rf.optimized.pred.test <- predict(rf.optimized, newdata = testing)
+confusionMatrix(data = rf.optimized.pred.test, reference = testing$y)
+
+```
+
+Relative to the original random forest, we sacrifice a little bit of overall accuracy on the optimized version, but _significantly_ improve our ability to detect and predict the minority class, in this case, account subscriptions.
+
+```{r rf.opt_roc}
+
+# Generate class probabilities
+rf.optimized.pred.test.probs <- predict(rf.optimized, newdata = testing, type = "prob")
+
+# Generate ROC curves
+rf.optimized.rocCurve <- roc(response = testing$y,
+                             predictor = rf.optimized.pred.test.probs[,"yes"],
+                             levels = rev(levels(testing$y)))
+
+plot(rf.optimized.rocCurve,
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+
+```
+
+#### Gradient Boosted Trees
+
+```{r gbm_confusion}
+
+# Generate confusion matrix on TRAINING data
+gbm.pred <- predict(gbm.fit, newdata = training)
+confusionMatrix(data = gbm.pred, reference = training$y)
+
+# Generate confusion matrix on TESTING data
+gbm.pred.test <- predict(gbm.fit, newdata = testing)
+confusionMatrix(data = gbm.pred.test, reference = testing$y)
+
+```
+
+The analysis above demonstrates the same challenge that plagued the original random forest model. We lose our ability to detect and predict account subscriptions on the test data, despite a well-fitting model on the training data.
+
+```{r gbm_roc}
+
+# Generate class probabilities
+gbm.pred.test.probs <- predict(gbm.fit, newdata = testing, type = "prob")
+
+# Generate ROC curve
+gbm.rocCurve <- roc(response = testing$y,
+                predictor = gbm.pred.test.probs[,"yes"],
+                levels = rev(levels(testing$y)))
+
+plot(gbm.rocCurve, 
+     print.thres = c(0.5, 0.2, 0.14, 0.13, 0.12), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+
+```
+
+#### Logistic Regression
+
+```{r glm_confusion}
+
+# Generate class probabilities first
+glm.pred <- predict(glmfit, newdata = training, type = "response")
+
+# Then, convert probabilities into class predictions based on a threshold set using trial and error
+threshold <- 0.15
+glm.pred.class <- ifelse(glm.pred < threshold, levels(training$y)[1], levels(training$y)[2])
+
+glm.pred.test <- predict(glmfit, newdata = testing, type = "response")
+glm.pred.test.class <- ifelse(glm.pred.test < threshold, levels(testing$y)[1], levels(testing$y)[2])
+
+# Generate confusion matrix on TRAINING data
+confusionMatrix(data = glm.pred.class, reference = training$y)
+
+# Generate confusion matrix on TESTING data
+confusionMatrix(data = glm.pred.test.class, reference = testing$y)
+
+```
+
+Let's generate an ROC Curve for our Logistic Regression model
+
+```{r glm_roc}
+
+# Generate ROC curve
+glm.rocCurve <- roc(response = testing$y,
+                predictor = glm.pred.test,
+                levels = rev(levels(testing$y)))
+
+plot(glm.rocCurve, 
+     print.thres = c(0.5), 
+     print.thres.pch = 16, 
+     print.thres.cex = 1.2,
+     legacy.axes = TRUE)
+
+```
+
+Revising the logistic regression model to focus on what matters
+
+Using ANOVA and trial and error, we've honed down the list of predictors to those that were statistically significant (at least at the 5% significance level).
+
+```{r glm_revised}
+
+# build new model
+glm.revised <- glm(y ~ age + 
+                   marital + 
+                   housing_loan + 
+                   personal_loan + 
+                   last_contact_type + 
+                   previous_outcome + 
+                   contact_count, 
+               data = training, 
+               family = "binomial")
+
+# verify statistical significance
+summary(glm.revised)
+anova(glm.revised)
+
+```
+
+On its own, the GLM has proven to be a weak predictive model for this data. However, we can tune the threshold for class predictions to improve model quality metrics. In our case, specificity is important, as well as sensitivity. So, we'll try a bunch of class probability thresholds and see the impact on both of these metrics.
+
+```{r glm_tuning}
+
+# Generate class probabilities first
+glm.revised.pred.probs.train <- predict(glm.revised, 
+                                        newdata = training, 
+                                        type = "response")
+
+# the thresholds to tune over
+thresholds <- seq(0.05, 0.25, by = 0.01)
+
+# generate sensitivities for each threshold
+glm.thresholds.train.sensitivities <- sapply(thresholds, function(x) {
+    
+    # Convert probabilities into class predictions
+    classPreds <- ifelse(glm.revised.pred.probs.train < x, 
+                         levels(training$y)[1], 
+                         levels(training$y)[2])
+    
+    # Calculate sensitivity
+    sensitivity(data = factor(classPreds), reference = training$y)
+})
+
+# generate specificities for each threshold
+glm.thresholds.train.specificities <- sapply(thresholds, function(x) {
+    # Convert probabilities into class predictions
+    classPreds <- ifelse(glm.revised.pred.probs.train < x, 
+                         levels(training$y)[1], 
+                         levels(training$y)[2])
+    
+    # Calculate sensitivity
+    specificity(data = factor(classPreds), reference = training$y)
+})
+
+# organize data for plotting
+glm.thresholds <- data.frame(threshold = thresholds,
+                             sens = glm.thresholds.train.sensitivities, 
+                             spec = glm.thresholds.train.specificities)
+
+# plot the data
+ggplot(data = glm.thresholds, aes(x = threshold)) +
+    geom_line(aes(y = sens, color = "Sensitivity")) +
+    geom_line(aes(y = spec, color = "Specificity")) +
+    labs(title = "Sensitivity and Specificity at Various Class Probability Thresholds",
+         x = "Class Probablity Threshold",
+         y = "Sensitivity and Specificity")
+
+```
+
+According to the analysis above, an acceptable balance between the 2 metrics lies at the class probablity threshold of 10-12%. Let's choose 10% and evaluate on the testing data.
+    
+```{r glm_revised_confusion}
+
+glm.revised.threshold <- 0.10
+
+glm.revised.pred.probs.test <- predict(glm.revised, 
+                                       newdata = testing, 
+                                       type = "response")
+
+glm.revised.pred.test.class <- ifelse(glm.revised.pred.probs.test < glm.revised.threshold, 
+                                      levels(testing$y)[1], 
+                                      levels(testing$y)[2])
+
+# Generate confusion matrix on TESTING data
+confusionMatrix(data = glm.revised.pred.test.class, reference = testing$y)
+
+```
+
+As shown above, this version of the logistic regression model, while not perfect, better detects, and predicts the minorty class -- new account subscribers.
+
+#### Taking a Step Back
+
+What percent of `yes` values in the test set are missed by _all_ the models we are considering?
+
+```{r all_missed}
+
+all.preds.train <- data.frame(truth = training$y,
+                              rf.reg = rf.pred,
+                              rf.opt = rf.optimized.pred,
+                              gbm = gbm.pred,
+                              glm = glm.pred.class)
+
+all.preds.test <- data.frame(truth = testing$y,
+                             rf.reg = rf.pred.test, 
+                             rf.opt = rf.optimized.pred.test,
+                             gbm = gbm.pred.test, 
+                             glm = glm.pred.test.class)
+
+# Define procedure for calculating missed values
+getMissed <- function(df) {
+    yesOnly <- df[df$truth == "yes",]
+    return (apply(yesOnly[,c(2:ncol(df))], 1, function(row) {
+        
+        ifelse(length(which(row == "no")) == 0, 1, 0)
+    }))
+}
+
+
+# training
+allMissed.train <- getMissed(all.preds.train)
+sum(allMissed.train)
+sum(allMissed.train) / length(allMissed.train)
+
+# testing
+allMissed <- getMissed(all.preds.test)
+sum(allMissed)
+sum(allMissed) / length(allMissed)
+
+```
+
+So, the maximum level of accuracy on `yes` values we can expect (for any of _our_ models) is about 85%.
+
+#### Training an ensemble
+
+Since no model is perfect and each are able to predict some portion of the test cases, could we improve our accuracy and specificity by combining these models? Let's try a decision tree across the predictions of the models we have just built.
+
+```{r combined_model}
+
+decision.tree <- rpart(truth ~ rf.opt + gbm + glm, 
+                       data = all.preds.train, 
+                       method = "class")
+
+```
+
+Here is what our tree looks like using the default parameters
+
+```{r combined_tree}
+
+plot(decision.tree, 
+     uniform = TRUE, 
+     main = "Classification Tree for Our Classification Model")
+
+text(decision.tree, use.n = TRUE, all = TRUE, cex = 0.8)
+
+```
+
+Below, we generate predictions by combining all of our models. Note that we exclude the original random forest model because it seems to over-power all the others. Including the original random forest model ensures that we sucuumb to the original problem of imbalanced target variable distribution. 
+
+```{r combined_evaluate}
+
+pred.train <- predict(decision.tree, 
+                      newdata = all.preds.train[ , c(3:ncol(all.preds.train))],
+                      type = "class")
+
+pred.test <- predict(decision.tree,
+                     newdata = all.preds.test[ , c(3:ncol(all.preds.test))],
+                     type = "class")
+
+# Generate a confusion matrix on TRAINING data
+confusionMatrix(data = pred.train, reference = all.preds.train$truth)
+
+# Generate a confusion matrix on TESTING data
+confusionMatrix(data = pred.test, reference = all.preds.test$truth)
+
+```
+
+Surprisingly, the analysis the above shows a _worse_ performance on the testing data. Based on specificity (our ability to detect and predict the `yes` case), the optimized version of the random forest model is our best model.
+
+### Variable Importance
+
+Below, we list out the most important variables for each model.
 
 ```{r variable_importance}
 
 # variable importance
-varImp(rf.fit)
+head(varImp(rf.fit))
 
-varImp(gbm.fit)
+head(varImp(rf.optimized))
+
+head(varImp(gbm.fit))
 
 ```

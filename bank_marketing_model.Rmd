@@ -11,7 +11,7 @@ output:
     ]
 ---
 
-This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account.
+This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account. The data can be found [here](http://archive.ics.uci.edu/ml/datasets/Bank+Marketing).
 
 ### Preparing the environment
 
@@ -77,7 +77,7 @@ data <- rename(data, c("default" = "in_default",
 
 ```
 
-We should also remove variables that ought not to be part of the modelling. For example, we won't knw in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
+We should also remove variables that ought not to be part of the modelling. For example, we won't know in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
 
 ```{r remove_unnecessary}
 
@@ -321,7 +321,7 @@ ggplot(metrics, aes(x = threshold, y = Data, color = Resampled)) +
 
 Gradient Boosted Machines
 
-```{r train_gbm}
+```{r train_gbm, cache=TRUE}
 
 grid <- expand.grid(interaction.depth = seq(3, 7, by = 2),
                     n.trees = seq(500, 1000, by = 100),

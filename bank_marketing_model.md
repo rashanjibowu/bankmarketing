@@ -2,7 +2,7 @@
 Rashan Jibowu  
 May 18, 2015  
 
-This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account.
+This document details how a model was built using data from the UCI Machine Learning data repository. Our aim is to predict whether a customer is likely to open up a bank account. The data can be found [here](http://archive.ics.uci.edu/ml/datasets/Bank+Marketing).
 
 ### Preparing the environment
 
@@ -138,7 +138,7 @@ data <- rename(data, c("default" = "in_default",
        )
 ```
 
-We should also remove variables that ought not to be part of the modelling. For example, we won't knw in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
+We should also remove variables that ought not to be part of the modelling. For example, we won't know in advance the duration of a phone call. Call duration is generally dependent on the outcome, not predictive of it.
 
 
 ```r
@@ -422,23 +422,7 @@ gbm.fit <- train(y ~ .,
                  metric = metric,
                  maximize = TRUE,
                  verbose = FALSE)     
-```
 
-```
-## Loading required package: gbm
-## Loading required package: survival
-## 
-## Attaching package: 'survival'
-## 
-## The following object is masked from 'package:caret':
-## 
-##     cluster
-## 
-## Loading required package: splines
-## Loaded gbm 2.1.1
-```
-
-```r
 # plot the various model performances
 ggplot(gbm.fit) + theme(legend.position = "top")
 ```
@@ -768,27 +752,27 @@ confusionMatrix(data = gbm.pred.test, reference = testing$y)
 ## 
 ##           Reference
 ## Prediction  no yes
-##        no  990 101
-##        yes  10  29
-##                                           
-##                Accuracy : 0.9018          
-##                  95% CI : (0.8829, 0.9185)
-##     No Information Rate : 0.885           
-##     P-Value [Acc > NIR] : 0.04002         
-##                                           
-##                   Kappa : 0.3064          
-##  Mcnemar's Test P-Value : < 2e-16         
-##                                           
-##             Sensitivity : 0.9900          
-##             Specificity : 0.2231          
-##          Pos Pred Value : 0.9074          
-##          Neg Pred Value : 0.7436          
-##              Prevalence : 0.8850          
-##          Detection Rate : 0.8761          
-##    Detection Prevalence : 0.9655          
-##       Balanced Accuracy : 0.6065          
-##                                           
-##        'Positive' Class : no              
+##        no  990 102
+##        yes  10  28
+##                                          
+##                Accuracy : 0.9009         
+##                  95% CI : (0.882, 0.9177)
+##     No Information Rate : 0.885          
+##     P-Value [Acc > NIR] : 0.04916        
+##                                          
+##                   Kappa : 0.2967         
+##  Mcnemar's Test P-Value : < 2e-16        
+##                                          
+##             Sensitivity : 0.9900         
+##             Specificity : 0.2154         
+##          Pos Pred Value : 0.9066         
+##          Neg Pred Value : 0.7368         
+##              Prevalence : 0.8850         
+##          Detection Rate : 0.8761         
+##    Detection Prevalence : 0.9664         
+##       Balanced Accuracy : 0.6027         
+##                                          
+##        'Positive' Class : no             
 ## 
 ```
 
@@ -819,7 +803,7 @@ plot(gbm.rocCurve,
 ## roc.default(response = testing$y, predictor = gbm.pred.test.probs[,     "yes"], levels = rev(levels(testing$y)))
 ## 
 ## Data: gbm.pred.test.probs[, "yes"] in 130 controls (testing$y yes) > 1000 cases (testing$y no).
-## Area under the curve: 0.7372
+## Area under the curve: 0.7388
 ```
 
 #### Logistic Regression
@@ -1165,7 +1149,7 @@ sum(allMissed)
 ```
 
 ```
-## [1] 20
+## [1] 19
 ```
 
 ```r
@@ -1173,7 +1157,7 @@ sum(allMissed) / length(allMissed)
 ```
 
 ```
-## [1] 0.1538462
+## [1] 0.1461538
 ```
 
 So, the maximum level of accuracy on `yes` values we can expect (for any of _our_ models) is about 85%.
@@ -1257,25 +1241,25 @@ confusionMatrix(data = pred.test, reference = all.preds.test$truth)
 ## 
 ##           Reference
 ## Prediction  no yes
-##        no  802  79
-##        yes 198  51
+##        no  802  80
+##        yes 198  50
 ##                                           
-##                Accuracy : 0.7549          
-##                  95% CI : (0.7287, 0.7797)
+##                Accuracy : 0.754           
+##                  95% CI : (0.7278, 0.7788)
 ##     No Information Rate : 0.885           
 ##     P-Value [Acc > NIR] : 1               
 ##                                           
-##                   Kappa : 0.139           
-##  Mcnemar's Test P-Value : 1.342e-12       
+##                   Kappa : 0.1338          
+##  Mcnemar's Test P-Value : 2.264e-12       
 ##                                           
 ##             Sensitivity : 0.8020          
-##             Specificity : 0.3923          
-##          Pos Pred Value : 0.9103          
-##          Neg Pred Value : 0.2048          
+##             Specificity : 0.3846          
+##          Pos Pred Value : 0.9093          
+##          Neg Pred Value : 0.2016          
 ##              Prevalence : 0.8850          
 ##          Detection Rate : 0.7097          
-##    Detection Prevalence : 0.7796          
-##       Balanced Accuracy : 0.5972          
+##    Detection Prevalence : 0.7805          
+##       Balanced Accuracy : 0.5933          
 ##                                           
 ##        'Positive' Class : no              
 ## 
@@ -1384,33 +1368,33 @@ head(varImp(gbm.fit))
 ```
 ## $importance
 ##                                   Overall
-## age                           78.31142690
-## jobblue-collar                 2.26333821
-## jobentrepreneur                0.28701623
-## jobhousemaid                   0.66220835
-## jobmanagement                  2.59820780
-## jobretired                     3.64003300
-## jobself-employed               1.04156320
-## jobservices                    0.15772163
-## jobstudent                     1.11478861
-## jobtechnician                  1.25125923
-## jobunemployed                  0.07939544
-## jobunknown                     0.03645677
-## maritalmarried                 8.45015888
-## maritalsingle                  0.60271236
-## educationsecondary             3.43877003
-## educationtertiary              9.31125589
-## educationunknown               0.30582581
-## in_defaultyes                  0.41795071
-## balance                       65.81351312
-## housing_loanyes               12.21166295
-## personal_loanyes               3.59813736
-## last_contact_typetelephone     1.71069868
-## last_contact_typeunknown      17.52855977
-## contact_count                 13.19903088
-## days_since_last_contact       55.89455388
-## prev_campaigns_contact_count  26.37768144
-## previous_outcomeother          6.61228757
+## age                           82.96113593
+## jobblue-collar                 2.24791479
+## jobentrepreneur                0.28506038
+## jobhousemaid                   1.00174295
+## jobmanagement                  2.58050243
+## jobretired                     3.95139419
+## jobself-employed               1.03446552
+## jobservices                    0.24172967
+## jobstudent                     1.20644903
+## jobtechnician                  1.31206957
+## jobunemployed                  0.18514999
+## jobunknown                     0.03620833
+## maritalmarried                 8.77076438
+## maritalsingle                  0.68717946
+## educationsecondary             3.97219483
+## educationtertiary              9.45846635
+## educationunknown               0.30374178
+## in_defaultyes                  0.47613366
+## balance                       72.60392422
+## housing_loanyes               12.86190376
+## personal_loanyes               3.80261420
+## last_contact_typetelephone     1.79101634
+## last_contact_typeunknown      17.89811151
+## contact_count                 14.38467047
+## days_since_last_contact       60.40900744
+## prev_campaigns_contact_count  29.00564538
+## previous_outcomeother          6.77141463
 ## previous_outcomesuccess      100.00000000
 ## previous_outcomeunknown        0.00000000
 ## 
